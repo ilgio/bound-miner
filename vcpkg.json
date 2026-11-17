@@ -1,0 +1,29 @@
+{
+  "name": "bound",
+  "dependencies": [
+    "gtest",
+    {
+      "name": "leveldb",
+      "features": [
+        "snappy"
+      ]
+    },
+    "libsodium",
+    "nlohmann-json"
+  ],
+  "features": {
+    "gui": {
+      "description": "The desktop wallet, bound-qt (Qt 6 Widgets)",
+      "dependencies": [
+        {
+          "name": "qtbase",
+          "default-features": false,
+          "features": [
+            "png",
+            "widgets"
+          ]
+        }
+      ]
+    }
+  }
+}

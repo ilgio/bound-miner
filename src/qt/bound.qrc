@@ -1,0 +1,7 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/bound">
+    <file alias="icon.png">res/icon.png</file>
+    <file alias="logo-white.png">res/logo-white.png</file>
+  </qresource>
+</RCC>

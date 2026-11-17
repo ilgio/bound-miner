@@ -1,0 +1,8 @@
+bound-miner is a modified build of BOUND (https://github.com/Sonic-Bound/Bound), v1.1.0.
+BOUND is copyright its authors and is used under the MIT license (see LICENSE, unchanged).
+
+Changes in this build, by ilgio:
+  - mining on NVIDIA GPUs through CUDA (boundd --gpu, --gpubatch, bound-gpubench)
+  - no mining until the node is in step with the network
+  - a 5% developer fee on blocks mined on mainnet (see DEVFEE.md)
+This is an unofficial build, not made or endorsed by the BOUND project.

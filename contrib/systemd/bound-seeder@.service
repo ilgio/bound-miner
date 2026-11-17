@@ -1,0 +1,63 @@
+# The BOUND DNS seeder as a system service; the instance is the network. Only one can run on a
+# machine, since it holds DNS port 53 (on launch day the seeder moves to mainnet).
+# contrib/deploy/bound-server sets it up, stops another network's, and prints the DNS records to add:
+#   sudo bound-server seeder mainnet seed.example.org ns1.example.org
+#
+# By hand:
+#  1. In the DNS of a domain you control (here example.org), delegate a name to this machine:
+#       seed.example.org.  NS  ns1.example.org.
+#       ns1.example.org.   A   203.0.113.10        <- this machine's public IPv4 address
+#  2. Write /etc/bound/seeder-<network>.conf:
+#       BOUND_SEEDER_OPTIONS="--host seed.example.org --ns ns1.example.org --dnsaddr 10.0.0.5 --node 127.0.0.1"
+#     --dnsaddr is the address on this machine's network interface (ip -4 route get 1.1.1.1 shows
+#     it as "src"). On a cloud server that's a private address: the provider forwards the public
+#     one to it. Binding one address rather than all keeps clear of systemd-resolved, which holds
+#     port 53 on 127.0.0.53. --node 127.0.0.1 starts the crawl from this machine's own node.
+#  3. Open UDP 53 in the firewall, then:
+#       sudo systemctl enable --now bound-seeder@testnet
+#       dig @203.0.113.10 seed.example.org A
+#
+# Port 53 needs CAP_NET_BIND_SERVICE, granted here and nothing else.
+[Unit]
+Description=BOUND %i DNS seeder
+After=network-online.target boundd@%i.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bound
+Group=bound
+StateDirectory=bound
+EnvironmentFile=/etc/bound/seeder-%i.conf
+ExecStart=/usr/local/bin/bound-seeder --%i --datadir /var/lib/bound/seeder-%i --quiet $BOUND_SEEDER_OPTIONS
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=4096
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,66 @@
+# A BOUND node as a system service (Linux, systemd), one per network: boundd@testnet,
+# boundd@mainnet, boundd@regtest. contrib/deploy/bound-server sets all this up:
+#   sudo bound-server node testnet
+#
+# By hand, with the programs in /usr/local/bin:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin bound
+#   sudo install -m 644 contrib/systemd/*.service contrib/systemd/*.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now boundd@testnet
+#   journalctl -u boundd@testnet -f
+#
+# The chain, the indexes, any wallet and the RPC cookie are in /var/lib/bound/<network>. Talk to
+# the node as the same user, so the cookie can be read:
+#   sudo -u bound bound-cli --testnet --datadir /var/lib/bound/testnet getblockchaininfo
+#
+# Extra node options go in /etc/bound/boundd-<network>.conf, for example:
+#   BOUND_NODE_OPTIONS="--index --externalip 203.0.113.7"
+# (--index keeps what an explorer needs.) Open the network's P2P port in the firewall, TCP 18333
+# for testnet or 7333 for mainnet, so other nodes can connect. Never open the RPC port: the node
+# only listens on 127.0.0.1 for it anyway.
+[Unit]
+Description=BOUND %i node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bound
+Group=bound
+StateDirectory=bound
+StateDirectoryMode=0750
+EnvironmentFile=-/etc/bound/boundd-%i.conf
+ExecStart=/usr/local/bin/boundd --%i --datadir /var/lib/bound/%i node $BOUND_NODE_OPTIONS
+# Ctrl+C and SIGTERM both make it finish its current write and save its peers.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=4096
+
+# It needs nothing from the system but the network and its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

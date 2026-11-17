@@ -1,0 +1,35 @@
+# One health check of this server's BOUND services for a network, reported to a monitoring
+# service; bound-health@<network>.timer runs it every 5 minutes. contrib/deploy/bound-server sets
+# it up:
+#   sudo bound-server monitor testnet https://hc-ping.com/<your check's id>
+#
+# /etc/bound/health-<network>.conf holds the address to report to:
+#   BOUND_HEALTH_URL=https://hc-ping.com/<id>
+# A healthy check fetches that address; a failing one posts the reasons to <address>/fail
+# (Healthchecks.io and Better Stack's heartbeats both work that way). When reports stop coming
+# or say /fail, the service emails you.
+[Unit]
+Description=BOUND %i health check
+After=boundd@%i.service
+
+[Service]
+Type=oneshot
+User=bound
+Group=bound
+EnvironmentFile=/etc/bound/health-%i.conf
+ExecStart=/usr/local/sbin/bound-server health %i --report
+TimeoutStartSec=120
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/bound
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+UMask=0077

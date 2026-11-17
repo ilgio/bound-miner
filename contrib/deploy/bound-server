@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+# bound-server: sets up and looks after BOUND on a Linux server (milestone 14). It comes in the
+# Linux release package (share/bound/bound-server); `install` puts it in /usr/local/sbin.
+#
+#   bound-server install [<version> | <package.tar.gz>]   install or upgrade the programs: the newest
+#                                                         release unless told otherwise
+#   bound-server node <network> [--index]                 a node, as a service; opens its port
+#   bound-server explorer <network> <domain>              the block explorer at https://<domain>
+#   bound-server seeder <network> <seed name> <ns name> [<email>]
+#                                                         a DNS seeder; says which DNS records to add
+#   bound-server monitor <network> <url>                  report health to <url> every 5 minutes
+#   bound-server status                                   what runs here and how it's doing
+#   bound-server health <network> [--report]              one check (the monitor's timer runs it)
+#
+# <network> is testnet or mainnet, or regtest for trying this out. Every command but health
+# needs root (sudo). It runs on any Linux with systemd and glibc 2.35 or newer: Ubuntu
+# 22.04, Debian 12 or later. docs/running-a-server.md walks through it.
+set -euo pipefail
+
+readonly repo=Sonic-Bound/Bound
+readonly opt=/opt/bound
+readonly etc=/etc/bound
+readonly state=/var/lib/bound
+work=""
+
+say() { printf '%s\n' "$*"; }
+die() {
+  printf 'bound-server: %s\n' "$*" >&2
+  exit 1
+}
+need_root() { [[ $EUID -eq 0 ]] || die "run it as root: sudo bound-server $*"; }
+need_programs() { [[ -x /usr/local/bin/boundd ]] || die "install the programs first: sudo bound-server install"; }
+
+check_network() {
+  case "${1:-}" in
+    mainnet | testnet | regtest) ;;
+    *) die "the network is testnet, mainnet or regtest, not '${1:-}'" ;;
+  esac
+}
+p2p_port() { case "$1" in mainnet) echo 7333 ;; testnet) echo 18333 ;; regtest) echo 18544 ;; esac }
+default_explorer_port() { case "$1" in testnet) echo 8080 ;; mainnet) echo 8081 ;; regtest) echo 8082 ;; esac }
+# As the explorer's /health: twelve blocks' time, at least an hour.
+stale_after() { case "$1" in mainnet) echo 7200 ;; *) echo 3600 ;; esac }
+
+node_cli() {
+  local net=$1
+  shift
+  /usr/local/bin/bound-cli "--$net" --datadir "$state/$net" "$@"
+}
+# A number from bound-cli's JSON: json_number <name> < output
+json_number() { sed -n "s/^ *\"$1\": *\(-\{0,1\}[0-9][0-9]*\).*/\1/p" | head -1; }
+
+# A setting from one of the files in /etc/bound: conf_value <file> <name>
+conf_value() { [[ -r "$1" ]] && sed -n "s/^$2=\"\{0,1\}\([^\"]*\)\"\{0,1\}$/\1/p" "$1" | tail -1 || true; }
+# The value after an option in an option string: option_value "--port 8081 --quiet" --port
+option_value() {
+  local words previous=""
+  read -r -a words <<< "$1"
+  for word in "${words[@]}"; do
+    [[ "$previous" == "$2" ]] && { echo "$word"; return; }
+    previous=$word
+  done
+}
+
+explorer_port() {
+  local port
+  port=$(option_value "$(conf_value "$etc/explorer-$1.conf" BOUND_EXPLORER_OPTIONS)" --port)
+  echo "${port:-$(default_explorer_port "$1")}"
+}
+
+public_ip() { curl -4 -fsS -m 5 https://api.ipify.org 2>/dev/null || true; }
+# (An apostrophe inside "${x:-...}" would start a quoted string, so this is a function.)
+shown_ip() { if [[ -n "$1" ]]; then echo "$1"; else echo "<this server's public IP>"; fi; }
+local_ip() { ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1; }
+
+# Opens a port in the machine's own firewall, if it has one switched on (ufw; or the iptables rules
+# that some cloud images, Oracle's among them, ship with: everything but SSH rejected).
+open_port() {
+  local port=$1 proto=$2
+  if command -v ufw > /dev/null && ufw status 2> /dev/null | grep -q '^Status: active'; then
+    ufw allow "$port/$proto" > /dev/null
+    say "  this machine's firewall (ufw): $proto $port open"
+  elif command -v iptables > /dev/null && iptables -S INPUT 2> /dev/null | grep -qE '^-A INPUT -j (REJECT|DROP)( |$)'; then
+    if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2> /dev/null; then
+      local line
+      line=$(iptables -S INPUT | grep -nE '^-A INPUT -j (REJECT|DROP)( |$)' | head -1 | cut -d: -f1)
+      iptables -I INPUT "$((line - 1))" -p "$proto" --dport "$port" -j ACCEPT  # line 1 is the policy
+      if command -v netfilter-persistent > /dev/null; then netfilter-persistent save > /dev/null 2>&1 || true; fi
+    fi
+    say "  this machine's firewall (iptables): $proto $port open"
+  fi
+  say "  Allow $proto $port in your cloud provider's firewall too (Google Cloud: VPC firewall rules;"
+  say "  Oracle: the subnet's security list; AWS: the security group; Hetzner: its firewall, if any)."
+}
+
+wait_for_node() {
+  local net=$1 _
+  for _ in $(seq 1 60); do
+    if node_cli "$net" getblockchaininfo > /dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  die "boundd@$net didn't start: journalctl -u boundd@$net -n 50"
+}
+
+# Adds an option to /etc/bound/boundd-<network>.conf; false if it was there already.
+add_node_option() {
+  local net=$1 option=$2 file="$etc/boundd-$1.conf" current
+  current=$(conf_value "$file" BOUND_NODE_OPTIONS)
+  [[ " $current " == *" $option "* ]] && return 1
+  mkdir -p "$etc"
+  printf '# Options for boundd@%s (bound-server writes this; see boundd@.service).\nBOUND_NODE_OPTIONS="%s"\n' \
+    "$net" "${current:+$current }$option" > "$file"
+  chmod 644 "$file"
+}
+
+start_or_restart() {
+  if systemctl is-active --quiet "$1"; then systemctl restart "$1"; else systemctl enable --now "$1" > /dev/null 2>&1; fi
+}
+
+# ---- install -------------------------------------------------------------------------------
+
+# Before milestone 14 the units weren't per network: boundd.service and bound-explorer.service ran
+# testnet. The data directory stays the same, so nothing has to sync again.
+migrate_old_units() {
+  local migrated=()
+  if [[ -f /etc/systemd/system/boundd.service ]]; then
+    if systemctl is-enabled --quiet boundd.service 2> /dev/null; then migrated+=(boundd@testnet); fi
+    if grep -q -- '--index' /etc/systemd/system/boundd.service; then add_node_option testnet --index || true; fi
+    systemctl disable --now boundd.service > /dev/null 2>&1 || true
+    rm -f /etc/systemd/system/boundd.service
+  fi
+  if [[ -f /etc/systemd/system/bound-explorer.service ]]; then
+    if systemctl is-enabled --quiet bound-explorer.service 2> /dev/null; then migrated+=(bound-explorer@testnet); fi
+    systemctl disable --now bound-explorer.service > /dev/null 2>&1 || true
+    rm -f /etc/systemd/system/bound-explorer.service
+  fi
+  if [[ -f /etc/systemd/system/bound-seeder.service ]]; then
+    systemctl disable --now bound-seeder.service > /dev/null 2>&1 || true
+    rm -f /etc/systemd/system/bound-seeder.service
+    say "  the old bound-seeder.service is gone: set the seeder up again with bound-server seeder"
+  fi
+  systemctl daemon-reload
+  for unit in "${migrated[@]}"; do
+    systemctl enable --now "$unit" > /dev/null 2>&1
+    say "  moved to $unit (same data directory)"
+  done
+}
+
+cmd_install() {
+  need_root install
+  command -v systemctl > /dev/null || die "this needs systemd"
+  local arch
+  case "$(uname -m)" in
+    x86_64) arch=x86_64 ;;
+    aarch64 | arm64) arch=aarch64 ;;
+    *) die "there's no BOUND release for $(uname -m): build it from source" ;;
+  esac
+  work=$(mktemp -d)  # global: the trap runs after this function has returned
+  trap 'rm -rf "$work"' EXIT
+  local package
+  if [[ -n "${1:-}" && -f "$1" ]]; then
+    package=$1
+    say "== Installing $package (a file you supplied: its checksum is yours to check)"
+  else
+    local version=${1:-}
+    version=${version#v}
+    if [[ -z "$version" ]]; then
+      version=$(curl -fsSL "https://api.github.com/repos/$repo/releases?per_page=1" | sed -n 's/^ *"tag_name": *"v\([^"]*\)".*/\1/p' | head -1)
+      [[ -n "$version" ]] || die "couldn't find the newest release on github.com/$repo"
+    fi
+    local name="bound-$version-$arch-linux-gnu.tar.gz" base="https://github.com/$repo/releases/download/v$version"
+    say "== Downloading BOUND $version for $arch"
+    curl -fsSL -o "$work/$name" "$base/$name" || die "release v$version has no $name"
+    curl -fsSL -o "$work/SHA256SUMS" "$base/SHA256SUMS" || die "release v$version has no SHA256SUMS"
+    (cd "$work" && sha256sum --ignore-missing --quiet -c SHA256SUMS) || die "$name doesn't match SHA256SUMS: not installing it"
+    say "  its SHA-256 matches the release's SHA256SUMS"
+    package=$work/$name
+  fi
+  mkdir -p "$work/unpacked"
+  tar -xzf "$package" -C "$work/unpacked"
+  local dir
+  dir=$(find "$work/unpacked" -mindepth 1 -maxdepth 1 -type d -name 'bound-*' | head -1)
+  [[ -n "$dir" && -x "$dir/bin/boundd" ]] || die "$package isn't a BOUND release package"
+  local line version
+  line=$("$dir/bin/boundd" --version 2>&1 | head -1) || die "its programs don't run here: $line"
+  version=$(awk '{print $2}' <<< "$line")
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "boundd --version said '$line', not a version"
+
+  mkdir -p "$opt"
+  rm -rf "$opt/${version:?}.new"
+  cp -a "$dir" "$opt/$version.new"
+  rm -rf "$opt/${version:?}"
+  mv "$opt/$version.new" "$opt/$version"
+  ln -sfn "$opt/$version" "$opt/current"
+  for program in boundd bound-cli bound-explorer bound-seeder; do ln -sfn "$opt/current/bin/$program" "/usr/local/bin/$program"; done
+  ln -sfn "$opt/current/share/bound/bound-server" /usr/local/sbin/bound-server
+  install -m 644 "$opt/current/share/bound/systemd/"* /etc/systemd/system/
+  id bound > /dev/null 2>&1 || useradd --system --no-create-home --home-dir "$state" --shell /usr/sbin/nologin bound
+  mkdir -p "$etc"
+  migrate_old_units
+
+  # What runs now runs the new version.
+  local unit
+  for unit in $(systemctl list-units --type=service --state=running --no-legend --plain 'boundd@*' 'bound-explorer@*' 'bound-seeder@*' | awk '{print $1}'); do
+    systemctl restart "$unit"
+    say "  restarted $unit"
+  done
+  # Keep the three newest versions (and the one in use), to go back with: bound-server install <version>
+  local current old
+  current=$(readlink -f "$opt/current")
+  for old in $(find "$opt" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' | sort -V | head -n -3); do
+    [[ "$(readlink -f "$old")" == "$current" ]] || rm -rf "$old"
+  done
+  say "Installed: $line"
+  say "Next: sudo bound-server node mainnet"
+}
+
+# ---- node ----------------------------------------------------------------------------------
+
+cmd_node() {
+  need_root node
+  need_programs
+  local net=${1:-}
+  check_network "$net"
+  local changed=no
+  if [[ "${2:-}" == --index ]] && add_node_option "$net" --index; then changed=yes; fi
+  if [[ $changed == yes ]]; then
+    systemctl enable boundd@"$net" > /dev/null 2>&1
+    systemctl restart boundd@"$net"
+  else
+    systemctl enable --now boundd@"$net" > /dev/null 2>&1
+  fi
+  say "== boundd@$net is running"
+  open_port "$(p2p_port "$net")" tcp
+  wait_for_node "$net"
+  local info height
+  info=$(node_cli "$net" getblockchaininfo)
+  height=$(json_number blocks <<< "$info")
+  say "  height $height; it finds its peers by itself. Logs: journalctl -u boundd@$net -f"
+}
+
+# ---- explorer ------------------------------------------------------------------------------
+
+install_caddy() {
+  command -v caddy > /dev/null && return
+  say "  installing Caddy (the web server that fetches the HTTPS certificate)"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  if ! apt-get install -y -qq caddy > /dev/null 2>&1; then
+    # Not in this release's own packages (Ubuntu 22.04): Caddy's official repository.
+    apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg > /dev/null
+    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -qq
+    apt-get install -y -qq caddy > /dev/null
+  fi
+}
+
+# /etc/caddy/Caddyfile imports /etc/caddy/bound/*.caddy, one site per file. The package's sample
+# Caddyfile (a page on port 80) is set aside; anything else is kept, with the import added.
+caddy_import() {
+  local file=/etc/caddy/Caddyfile
+  mkdir -p /etc/caddy/bound
+  grep -q '^import /etc/caddy/bound/\*\.caddy' "$file" 2> /dev/null && return
+  if [[ ! -f "$file" ]] || ! grep -vE '^[[:space:]]*(#|$)' "$file" | grep -qvE '^[[:space:]]*(:80 \{|root \* /usr/share/caddy|file_server|\})[[:space:]]*$'; then
+    [[ -f "$file" ]] && mv "$file" "$file.sample"
+    printf '# Written by bound-server: each site is a file in /etc/caddy/bound.\nimport /etc/caddy/bound/*.caddy\n' > "$file"
+  else
+    printf '\n# Added by bound-server: the BOUND sites.\nimport /etc/caddy/bound/*.caddy\n' >> "$file"
+  fi
+}
+
+cmd_explorer() {
+  need_root explorer
+  need_programs
+  local net=${1:-} domain=${2:-}
+  check_network "$net"
+  [[ "$domain" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ || "$domain" == localhost ]] || die "usage: bound-server explorer <network> <domain>, e.g. explorer.example.org"
+  # One name, one explorer. On launch day mainnet takes the explorer's name, so testnet's moves first.
+  local other
+  for other in mainnet testnet regtest; do
+    [[ "$other" == "$net" ]] && continue
+    if grep -qx "$domain {" "/etc/caddy/bound/explorer-$other.caddy" 2> /dev/null; then
+      die "$domain is $other's explorer now. Give that one another name first: sudo bound-server explorer $other $other-$domain"
+    fi
+  done
+
+  # The explorer's pages need the node's indexes.
+  if add_node_option "$net" --index; then
+    systemctl enable boundd@"$net" > /dev/null 2>&1
+    systemctl restart boundd@"$net"
+    say "  boundd@$net now keeps the indexes (--index); it builds them as it goes"
+  else
+    systemctl enable --now boundd@"$net" > /dev/null 2>&1
+  fi
+  local port
+  port=$(explorer_port "$net")
+  if [[ ! -f "$etc/explorer-$net.conf" ]]; then
+    printf '# Options for bound-explorer@%s (bound-server writes this; see bound-explorer@.service).\nBOUND_EXPLORER_OPTIONS="--port %s"\n' \
+      "$net" "$port" > "$etc/explorer-$net.conf"
+    chmod 644 "$etc/explorer-$net.conf"
+  fi
+  start_or_restart bound-explorer@"$net"
+  say "== bound-explorer@$net is serving 127.0.0.1:$port"
+
+  install_caddy
+  caddy_import
+  printf '# Written by bound-server: the BOUND %s explorer.\n%s {\n\tencode gzip\n\treverse_proxy 127.0.0.1:%s\n}\n' \
+    "$net" "$domain" "$port" > "/etc/caddy/bound/explorer-$net.caddy"
+  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /dev/null 2>&1 || die "Caddy refuses the configuration: caddy validate --config /etc/caddy/Caddyfile"
+  systemctl enable caddy > /dev/null 2>&1
+  if systemctl is-active --quiet caddy; then systemctl reload caddy; else systemctl start caddy; fi
+  say "== Caddy serves https://$domain"
+  open_port 80 tcp
+  open_port 443 tcp
+
+  [[ "$domain" == localhost ]] && return  # trying it out: Caddy's own certificate, no DNS
+  local here there
+  here=$(public_ip)
+  there=$(getent ahostsv4 "$domain" | awk '{print $1; exit}' || true)
+  if [[ -z "$there" ]]; then
+    say "  $domain doesn't resolve yet. In your domain's DNS add:  $domain  A  $(shown_ip "$here")"
+  elif [[ -n "$here" && "$there" != "$here" ]]; then
+    say "  $domain points to $there, but this server is $here: change its A record to $here"
+  fi
+  say "  Once $domain points here, Caddy gets a certificate within a minute or two. Then:"
+  say "  https://$domain/ for people, https://$domain/health for an uptime monitor."
+}
+
+# ---- seeder --------------------------------------------------------------------------------
+
+cmd_seeder() {
+  need_root seeder
+  need_programs
+  local net=${1:-} host=${2:-} ns=${3:-} email=${4:-}
+  check_network "$net"
+  [[ -n "$host" && -n "$ns" ]] || die "usage: bound-server seeder <network> <seed name> <ns name> [<email>], e.g. seed.example.org ns1.example.org"
+  local mbox="hostmaster.$host"
+  [[ -n "$email" ]] && mbox=${email/@/.}  # DNS writes you@example.org as you.example.org
+  local address
+  address=$(local_ip)
+  [[ -n "$address" ]] || die "can't tell this machine's network address"
+
+  systemctl enable --now boundd@"$net" > /dev/null 2>&1
+  if ! command -v dig > /dev/null; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dnsutils > /dev/null 2>&1 || true
+  fi
+  # A machine's DNS port can answer for one network only: on launch day the seeder moves to mainnet.
+  local other
+  for other in mainnet testnet regtest; do
+    [[ "$other" == "$net" ]] && continue
+    if systemctl is-enabled --quiet bound-seeder@"$other" 2> /dev/null || systemctl is-active --quiet bound-seeder@"$other"; then
+      systemctl disable --now bound-seeder@"$other" > /dev/null 2>&1 || true
+      say "  stopped bound-seeder@$other: this machine's DNS port answers for $net now"
+    fi
+  done
+  printf '# Options for bound-seeder@%s (bound-server writes this; see bound-seeder@.service).\nBOUND_SEEDER_OPTIONS="--host %s --ns %s --mbox %s --dnsaddr %s --node 127.0.0.1"\n' \
+    "$net" "$host" "$ns" "$mbox" "$address" > "$etc/seeder-$net.conf"
+  chmod 644 "$etc/seeder-$net.conf"
+  start_or_restart bound-seeder@"$net"
+  sleep 2
+  systemctl is-active --quiet bound-seeder@"$net" || die "bound-seeder@$net didn't start: journalctl -u bound-seeder@$net -n 30"
+  say "== bound-seeder@$net answers DNS for $host on $address, UDP 53"
+  open_port 53 udp
+
+  local here
+  here=$(public_ip)
+  say "  In the DNS settings of the domain $host is under, add these two records:"
+  say "    ${host}.   NS   ${ns}."
+  say "    ${ns}.   A    $(shown_ip "$here")"
+  say "  It hands out nodes once it has crawled some (a few minutes). Check from anywhere:"
+  say "    dig $host A"
+  say "  Then put $host in the seeds of src/core/params.cpp, for the next release."
+}
+
+# ---- monitoring ----------------------------------------------------------------------------
+
+cmd_monitor() {
+  need_root monitor
+  need_programs
+  local net=${1:-} url=${2:-}
+  check_network "$net"
+  [[ "$url" =~ ^https?:// ]] || die "usage: bound-server monitor <network> <url>, e.g. https://hc-ping.com/<your check's id>"
+  printf '# Where bound-health@%s reports (bound-server writes this; see bound-health@.service).\nBOUND_HEALTH_URL=%s\n' \
+    "$net" "$url" > "$etc/health-$net.conf"
+  chmod 600 "$etc/health-$net.conf"
+  systemctl enable --now bound-health@"$net".timer > /dev/null 2>&1
+  say "== Every 5 minutes, bound-health@$net reports to $url"
+  if systemctl start bound-health@"$net".service; then
+    say "  first report: healthy"
+  else
+    say "  first report: unhealthy (journalctl -u bound-health@$net -n 20 says why)"
+  fi
+}
+
+# One check of a network's services here. Prints a line; returns 1 if something's wrong. With
+# --report, also tells $BOUND_HEALTH_URL.
+cmd_health() {
+  local net=${1:-} report=${2:-}
+  check_network "$net"
+  local problems=() facts=() info network now
+  now=$(date +%s)
+  if info=$(node_cli "$net" getblockchaininfo 2> /dev/null) && network=$(node_cli "$net" getnetworkinfo 2> /dev/null); then
+    local height time peers age
+    height=$(json_number blocks <<< "$info")
+    time=$(json_number time <<< "$info")
+    peers=$(json_number connections <<< "$network")
+    age=$(((now - ${time:-0}) / 60))
+    facts+=("height $height" "last block $age min ago" "$peers peers")
+    [[ "${peers:-0}" -gt 0 ]] || problems+=("the node has no peers")
+    [[ $((now - ${time:-0})) -le $(stale_after "$net") ]] || problems+=("no block for $age minutes")
+  else
+    problems+=("the node isn't answering")
+  fi
+  if systemctl is-enabled --quiet bound-explorer@"$net" 2> /dev/null; then
+    local code
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$(explorer_port "$net")/health" || true)
+    if [[ "$code" == 000 ]]; then problems+=("the explorer isn't answering"); else facts+=("explorer up"); fi
+  fi
+  if systemctl is-enabled --quiet bound-seeder@"$net" 2> /dev/null; then
+    local options host address
+    options=$(conf_value "$etc/seeder-$net.conf" BOUND_SEEDER_OPTIONS)
+    host=$(option_value "$options" --host)
+    address=$(option_value "$options" --dnsaddr)
+    if dig +time=3 +tries=1 "@$address" "$host" A 2> /dev/null | grep -q 'status: NOERROR'; then
+      facts+=("seeder up ($(dig +short +time=3 +tries=1 "@$address" "$host" A 2> /dev/null | wc -l) nodes handed out)")
+    else
+      problems+=("the DNS seeder isn't answering")
+    fi
+  fi
+
+  local text
+  if [[ ${#problems[@]} -eq 0 ]]; then
+    text="$net: healthy: $(IFS=,; echo "${facts[*]}" | sed 's/,/, /g')"
+  else
+    text="$net: UNHEALTHY: $(IFS=,; echo "${problems[*]}" | sed 's/,/, /g')"
+    [[ ${#facts[@]} -gt 0 ]] && text="$text ($(IFS=,; echo "${facts[*]}" | sed 's/,/, /g'))"
+  fi
+  say "$text"
+  if [[ "$report" == --report ]]; then
+    [[ -n "${BOUND_HEALTH_URL:-}" ]] || die "BOUND_HEALTH_URL isn't set (bound-server monitor sets it)"
+    if [[ ${#problems[@]} -eq 0 ]]; then
+      curl -fsS -m 10 --retry 3 -o /dev/null "$BOUND_HEALTH_URL" || say "couldn't reach $BOUND_HEALTH_URL"
+    else
+      curl -fsS -m 10 --retry 3 -o /dev/null --data-raw "$text" "${BOUND_HEALTH_URL%/}/fail" || say "couldn't reach $BOUND_HEALTH_URL"
+    fi
+  fi
+  [[ ${#problems[@]} -eq 0 ]]
+}
+
+cmd_status() {
+  need_root status
+  if [[ -x /usr/local/bin/boundd ]]; then
+    say "$(/usr/local/bin/boundd --version | head -1), in $(readlink -f "$opt/current" 2> /dev/null || echo /usr/local/bin)"
+  else
+    say "BOUND isn't installed: sudo bound-server install"
+    return
+  fi
+  local net any=no
+  for net in mainnet testnet regtest; do
+    systemctl is-enabled --quiet boundd@"$net" 2> /dev/null || continue
+    any=yes
+    cmd_health "$net" || true
+  done
+  [[ $any == yes ]] || say "No node set up yet: sudo bound-server node mainnet"
+  say ""
+  systemctl list-units --all --no-legend --plain 'boundd@*' 'bound-explorer@*' 'bound-seeder@*' 'bound-health@*.timer' caddy.service 2> /dev/null |
+    awk '{printf "  %-34s %s %s\n", $1, $3, $4}'
+}
+
+usage() {
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  exit 2
+}
+
+command=${1:-}
+[[ $# -gt 0 ]] && shift
+case "$command" in
+  install) cmd_install "$@" ;;
+  node) cmd_node "$@" ;;
+  explorer) cmd_explorer "$@" ;;
+  seeder) cmd_seeder "$@" ;;
+  monitor) cmd_monitor "$@" ;;
+  health) cmd_health "$@" ;;
+  status) cmd_status ;;
+  *) usage ;;
+esac

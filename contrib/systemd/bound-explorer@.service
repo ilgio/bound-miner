@@ -1,0 +1,56 @@
+# The BOUND block explorer as a system service, beside boundd@<network>.service, which must run
+# with --index for the transaction and address pages. contrib/deploy/bound-server sets it up, with
+# HTTPS from Caddy in front:
+#   sudo bound-server explorer testnet explorer.example.org
+#
+# It serves plain HTTP on 127.0.0.1, port 8080 unless /etc/bound/explorer-<network>.conf says
+# otherwise:
+#   BOUND_EXPLORER_OPTIONS="--port 8081"
+# A TLS-terminating proxy in front serves the public, such as Caddy, which fetches its own
+# certificate. In /etc/caddy/Caddyfile:
+#   explorer.example.org {
+#       reverse_proxy 127.0.0.1:8080
+#   }
+# /health is there for uptime monitors (503 when the node is down, alone or stuck).
+[Unit]
+Description=BOUND %i block explorer
+After=boundd@%i.service
+Wants=boundd@%i.service
+
+[Service]
+Type=simple
+User=bound
+Group=bound
+EnvironmentFile=-/etc/bound/explorer-%i.conf
+ExecStart=/usr/local/bin/bound-explorer --%i --datadir /var/lib/bound/%i --quiet $BOUND_EXPLORER_OPTIONS
+Restart=on-failure
+RestartSec=5
+
+# It only reads the node's cookie and talks to 127.0.0.1.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/bound
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
